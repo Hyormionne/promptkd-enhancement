@@ -1,0 +1,80 @@
+# ✅ Colab 호환 PromptKD 간단 학습 스크립트
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# 1. 디바이스 설정
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 2. 모델 로드 (Teacher: GPT2-large, Student: GPT2)
+teacher_model = AutoModelForCausalLM.from_pretrained("gpt2-large").to(device)
+student_model = AutoModelForCausalLM.from_pretrained("gpt2").to(device)
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+
+# 3. Teacher 모델은 학습하지 않음
+teacher_model.eval()
+for param in teacher_model.parameters():
+    param.requires_grad = False
+
+# 4. 학습할 Prompt 임베딩 생성
+prompt_len = 5
+prompt_embedding = nn.Parameter(torch.randn(prompt_len, student_model.config.hidden_size).to(device))
+optimizer = torch.optim.AdamW([prompt_embedding], lr=5e-4)
+
+# 5. Yelp 데이터셋 일부 로드 및 전처리
+dataset = load_dataset("yelp_review_full", split="train[:1%]")
+
+def preprocess(example):
+    prompt = "Summarize the following review:\n"
+    text = prompt + example["text"]
+    inputs = tokenizer(text, return_tensors="pt", padding="max_length", truncation=True, max_length=128)
+    inputs["labels"] = inputs["input_ids"].clone()
+    return {k: v.squeeze() for k, v in inputs.items()}
+
+# 전처리 및 DataLoader 구성
+dataset = dataset.map(preprocess)
+dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+dataloader = DataLoader(dataset, batch_size=2)
+
+# 6. 학습 루프
+for epoch in range(1):
+    for batch in tqdm(dataloader):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        # Teacher 모델 추론
+        with torch.no_grad():
+            teacher_logits = teacher_model(input_ids, attention_mask=attention_mask).logits
+
+        # Student 입력에 prompt embedding 붙이기
+        input_embeds = student_model.transformer.wte(input_ids)
+        prompt_broadcast = prompt_embedding.unsqueeze(0).expand(input_embeds.size(0), -1, -1)
+        combined_embeds = torch.cat([prompt_broadcast, input_embeds], dim=1)
+        extended_mask = F.pad(attention_mask, (prompt_len, 0), value=1)
+
+        # Student forward + KL loss
+        student_output = student_model(
+            inputs_embeds=combined_embeds[:, :input_ids.size(1)],
+            attention_mask=extended_mask[:, :input_ids.size(1)],
+            labels=labels
+        )
+        student_logits = student_output.logits
+
+        loss = F.kl_div(
+            F.log_softmax(student_logits, dim=-1),
+            F.softmax(teacher_logits, dim=-1),
+            reduction="batchmean"
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"\u2705 Epoch {epoch+1} Loss: {loss.item():.4f}")
